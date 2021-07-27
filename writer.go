@@ -25,6 +25,7 @@ type Writer struct {
 	join sync.WaitGroup
 	msgs chan writerMessage
 	done chan struct{}
+	errChan chan error
 
 	// writer stats are all made of atomic values, no need for synchronization.
 	// Use a pointer to ensure 64-bit alignment of the values.
@@ -117,6 +118,11 @@ type WriterConfig struct {
 	// the returned value. Use this only if you don't care about guarantees of
 	// whether the messages were written to kafka.
 	Async bool
+
+	// An optional function called when the writer succeeds or fails the
+	// delivery of messages to a kafka partition. When writing the messages
+	// fails, the `err` parameter will be non-nil.
+	Completion func(message Message, err error)
 
 	// CompressionCodec set the codec to be used to compress Kafka messages.
 	// Note that messages are allowed to overwrite the compression codec individually.
@@ -260,6 +266,7 @@ func NewWriter(config WriterConfig) *Writer {
 		config: config,
 		msgs:   make(chan writerMessage, config.QueueCapacity),
 		done:   make(chan struct{}),
+		errChan: make(chan error),
 		stats: &writerStats{
 			dialTime:  makeSummary(),
 			writeTime: makeSummary(),
@@ -306,6 +313,8 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 	var res chan error
 	if !w.config.Async {
 		res = make(chan error, len(msgs))
+	} else if w.config.Completion != nil {
+		res = w.errChan
 	}
 	t0 := time.Now()
 
@@ -446,6 +455,16 @@ func (w *Writer) run() {
 
 	ticker := time.NewTicker(w.config.RebalanceInterval)
 	defer ticker.Stop()
+
+	if w.config.Async && w.config.Completion != nil {
+		go func() {
+			for e := range w.errChan {
+				if we, ok := e.(*writerError); ok {
+					w.config.Completion(we.msg, e)
+				}
+			}
+		}()
+	}
 
 	var rebalance = true
 	var writers = make(map[int]partitionWriter)
